@@ -7,6 +7,7 @@ import sqlite3
 import time
 import requests
 import os
+import json
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -18,7 +19,7 @@ from aiogram.exceptions import TelegramRetryAfter
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Читаем переменные окружения
+# --- Переменные окружения ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SHEET_ID = os.getenv("SHEET_ID")
 SERVICE_ACCOUNT_JSON = os.getenv("SERVICE_ACCOUNT_JSON")
@@ -32,6 +33,7 @@ DB_SUBS = "subs.db"
 MAX_COLS = 25
 MAX_MESSAGE_LENGTH = 4000
 
+# --- Инициализация баз ---
 def init_db_orders():
     conn = sqlite3.connect(DB_ORDERS)
     conn.execute("PRAGMA journal_mode=WAL;")
@@ -64,17 +66,13 @@ def init_db_subs():
     conn.commit()
     conn.close()
 
-# --- остальные функции работы с БД и Google Sheets остаются такими же, как в локальной версии ---
-# Важно: для авторизации в Google Sheets используем JSON из переменной окружения
-
+# --- Работа с Google Sheets ---
 def get_sheet():
     scope = [
         "https://spreadsheets.google.com/feeds",
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive"
     ]
-    # JSON ключ хранится в переменной окружения
-    import json
     creds_dict = json.loads(SERVICE_ACCOUNT_JSON)
     creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
     client = gspread.authorize(creds)
@@ -82,8 +80,110 @@ def get_sheet():
     ws = doc.get_worksheet(0)
     return ws
 
-# --- poll_loop, send_safe, make_hash, make_line и т.д. остаются без изменений ---
+# --- Вспомогательные функции ---
+def make_line(row):
+    return " | ".join([x.strip() for x in row if x.strip()])
 
+def make_hash(line):
+    return hashlib.sha256(line.encode()).hexdigest()
+
+def is_url(text):
+    return re.match(r"^https?://", text)
+
+def shorten_clck(long_url):
+    try:
+        r = requests.get("https://clck.ru/--", params={"url": long_url}, timeout=7)
+        if r.status_code == 200:
+            return r.text.strip()
+        return f"Ошибка: {r.status_code}"
+    except Exception as e:
+        return f"Ошибка: {e}"
+
+def add_subscriber(chat_id):
+    conn = sqlite3.connect(DB_SUBS)
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO subscribers(chat_id) VALUES(?)", (chat_id,))
+    conn.commit()
+    conn.close()
+
+def remove_subscriber(chat_id):
+    conn = sqlite3.connect(DB_SUBS)
+    c = conn.cursor()
+    c.execute("DELETE FROM subscribers WHERE chat_id=?", (chat_id,))
+    conn.commit()
+    conn.close()
+
+def get_subscribers():
+    conn = sqlite3.connect(DB_SUBS)
+    c = conn.cursor()
+    c.execute("SELECT chat_id FROM subscribers")
+    subs = [row[0] for row in c.fetchall()]
+    conn.close()
+    return subs
+
+async def send_safe(bot: Bot, chat_id: int, text: str):
+    try:
+        if len(text) > MAX_MESSAGE_LENGTH:
+            text = text[:MAX_MESSAGE_LENGTH]
+        await bot.send_message(chat_id, text)
+    except TelegramRetryAfter as e:
+        await asyncio.sleep(e.retry_after)
+        await send_safe(bot, chat_id, text)
+    except Exception as e:
+        logger.error(f"send_safe error: {e}")
+
+# --- Основной цикл опроса ---
+async def poll_loop(bot: Bot):
+    while True:
+        try:
+            ws = get_sheet()
+            rows = ws.get_all_values()
+            conn = sqlite3.connect(DB_ORDERS)
+            c = conn.cursor()
+
+            for idx, row in enumerate(rows, start=1):
+                if not any(row):
+                    continue
+                line = make_line(row)
+                h = make_hash(line)
+
+                c.execute("SELECT hash FROM orders WHERE row_index=?", (idx,))
+                res = c.fetchone()
+                if res is None:
+                    c.execute("INSERT INTO orders(row_index, hash, line) VALUES(?,?,?)", (idx, h, line))
+                    c.execute("INSERT OR REPLACE INTO pending(row_index, hash, line, ts, is_new) VALUES(?,?,?,?,1)",
+                              (idx, h, line, time.time()))
+                elif res[0] != h:
+                    c.execute("UPDATE orders SET hash=?, line=?, updated_at=strftime('%s','now') WHERE row_index=?",
+                              (h, line, idx))
+                    c.execute("INSERT OR REPLACE INTO pending(row_index, hash, line, ts, is_new) VALUES(?,?,?,?,0)",
+                              (idx, h, line, time.time()))
+
+            conn.commit()
+            conn.close()
+
+            await notify_subscribers(bot)
+
+        except Exception as e:
+            logger.error(f"poll_loop error: {e}")
+
+        await asyncio.sleep(POLL_INTERVAL)
+
+async def notify_subscribers(bot: Bot):
+    conn = sqlite3.connect(DB_ORDERS)
+    c = conn.cursor()
+    c.execute("SELECT row_index, line, is_new FROM pending WHERE ts <= ?", (time.time() - NOTIFY_DELAY,))
+    rows = c.fetchall()
+    for row_index, line, is_new in rows:
+        msg = "🆕 Новый заказ:\n" + line if is_new else "♻ Обновлён заказ:\n" + line
+        subs = get_subscribers()
+        for chat_id in subs:
+            await send_safe(bot, chat_id, msg)
+        c.execute("DELETE FROM pending WHERE row_index=?", (row_index,))
+    conn.commit()
+    conn.close()
+
+# --- Основной запуск ---
 async def main():
     init_db_orders()
     init_db_subs()
