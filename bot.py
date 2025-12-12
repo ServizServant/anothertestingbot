@@ -33,6 +33,9 @@ DB_SUBS = "subs.db"
 MAX_COLS = 25
 MAX_MESSAGE_LENGTH = 4000
 
+# --- Флаг тихого старта ---
+FIRST_RUN = True  # на первом проходе заполняем orders, но НЕ кладем в pending
+
 # --- Инициализация баз ---
 def init_db_orders():
     conn = sqlite3.connect(DB_ORDERS)
@@ -82,13 +85,19 @@ def get_sheet():
 
 # --- Вспомогательные функции ---
 def make_line(row):
-    return " | ".join([x.strip() for x in row if x.strip()])
+    # нормализация строки (без пустых ячеек, чистые пробелы)
+    parts = []
+    for x in row[:MAX_COLS]:
+        s = (x or "").strip()
+        if s:
+            parts.append(s)
+    return " | ".join(parts)
 
 def make_hash(line):
     return hashlib.sha256(line.encode()).hexdigest()
 
 def is_url(text):
-    return re.match(r"^https?://", text)
+    return re.match(r"^https?://", text or "")
 
 def shorten_clck(long_url):
     try:
@@ -132,8 +141,9 @@ async def send_safe(bot: Bot, chat_id: int, text: str):
     except Exception as e:
         logger.error(f"send_safe error: {e}")
 
-# --- Основной цикл опроса ---
+# --- Основной цикл опроса + тихий старт ---
 async def poll_loop(bot: Bot):
+    global FIRST_RUN
     while True:
         try:
             ws = get_sheet()
@@ -142,30 +152,50 @@ async def poll_loop(bot: Bot):
             c = conn.cursor()
 
             for idx, row in enumerate(rows, start=1):
+                # пропускаем пустые строки
                 if not any(row):
                     continue
                 line = make_line(row)
+                if not line:
+                    continue
                 h = make_hash(line)
 
                 c.execute("SELECT hash FROM orders WHERE row_index=?", (idx,))
                 res = c.fetchone()
+
                 if res is None:
+                    # новая строка: всегда записываем в orders
                     c.execute("INSERT INTO orders(row_index, hash, line) VALUES(?,?,?)", (idx, h, line))
-                    c.execute("INSERT OR REPLACE INTO pending(row_index, hash, line, ts, is_new) VALUES(?,?,?,?,1)",
-                              (idx, h, line, time.time()))
-                elif res[0] != h:
-                    c.execute("UPDATE orders SET hash=?, line=?, updated_at=strftime('%s','now') WHERE row_index=?",
-                              (h, line, idx))
-                    c.execute("INSERT OR REPLACE INTO pending(row_index, hash, line, ts, is_new) VALUES(?,?,?,?,0)",
-                              (idx, h, line, time.time()))
+                    # тихий старт: не кладем в pending на первом проходе
+                    if not FIRST_RUN:
+                        c.execute(
+                            "INSERT OR REPLACE INTO pending(row_index, hash, line, ts, is_new) VALUES(?,?,?,?,1)",
+                            (idx, h, line, time.time())
+                        )
+                else:
+                    # строка существовала; если изменился хеш — считаем обновлением
+                    if res[0] != h:
+                        c.execute(
+                            "UPDATE orders SET hash=?, line=?, updated_at=strftime('%s','now') WHERE row_index=?",
+                            (h, line, idx)
+                        )
+                        c.execute(
+                            "INSERT OR REPLACE INTO pending(row_index, hash, line, ts, is_new) VALUES(?,?,?,?,0)",
+                            (idx, h, line, time.time())
+                        )
 
             conn.commit()
             conn.close()
 
+            # рассылка готовых уведомлений
             await notify_subscribers(bot)
 
         except Exception as e:
             logger.error(f"poll_loop error: {e}")
+
+        # после первого цикла снимаем флаг тихого старта
+        if FIRST_RUN:
+            FIRST_RUN = False
 
         await asyncio.sleep(POLL_INTERVAL)
 
@@ -175,7 +205,7 @@ async def notify_subscribers(bot: Bot):
     c.execute("SELECT row_index, line, is_new FROM pending WHERE ts <= ?", (time.time() - NOTIFY_DELAY,))
     rows = c.fetchall()
     for row_index, line, is_new in rows:
-        msg = "🆕 Новый заказ:\n" + line if is_new else "♻ Обновлён заказ:\n" + line
+        msg = ("🆕 Новый заказ:\n" + line) if is_new else ("♻ Обновлён заказ:\n" + line)
         subs = get_subscribers()
         for chat_id in subs:
             await send_safe(bot, chat_id, msg)
