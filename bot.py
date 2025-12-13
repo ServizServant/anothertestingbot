@@ -34,7 +34,7 @@ MAX_COLS = 25
 MAX_MESSAGE_LENGTH = 4000
 
 # --- Флаг тихого старта ---
-FIRST_RUN = True  # на первом проходе заполняем orders, но НЕ кладем в pending
+FIRST_RUN = True
 
 # --- Инициализация баз ---
 def init_db_orders():
@@ -85,7 +85,6 @@ def get_sheet():
 
 # --- Вспомогательные функции ---
 def make_line(row):
-    # нормализация строки (без пустых ячеек, чистые пробелы)
     parts = []
     for x in row[:MAX_COLS]:
         s = (x or "").strip()
@@ -152,7 +151,6 @@ async def poll_loop(bot: Bot):
             c = conn.cursor()
 
             for idx, row in enumerate(rows, start=1):
-                # пропускаем пустые строки
                 if not any(row):
                     continue
                 line = make_line(row)
@@ -164,16 +162,13 @@ async def poll_loop(bot: Bot):
                 res = c.fetchone()
 
                 if res is None:
-                    # новая строка: всегда записываем в orders
                     c.execute("INSERT INTO orders(row_index, hash, line) VALUES(?,?,?)", (idx, h, line))
-                    # тихий старт: не кладем в pending на первом проходе
                     if not FIRST_RUN:
                         c.execute(
                             "INSERT OR REPLACE INTO pending(row_index, hash, line, ts, is_new) VALUES(?,?,?,?,1)",
                             (idx, h, line, time.time())
                         )
                 else:
-                    # строка существовала; если изменился хеш — считаем обновлением
                     if res[0] != h:
                         c.execute(
                             "UPDATE orders SET hash=?, line=?, updated_at=strftime('%s','now') WHERE row_index=?",
@@ -187,13 +182,11 @@ async def poll_loop(bot: Bot):
             conn.commit()
             conn.close()
 
-            # рассылка готовых уведомлений
             await notify_subscribers(bot)
 
         except Exception as e:
             logger.error(f"poll_loop error: {e}")
 
-        # после первого цикла снимаем флаг тихого старта
         if FIRST_RUN:
             FIRST_RUN = False
 
